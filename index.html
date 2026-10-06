@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f5f7fb">
+  <title>PrintFlow POS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <main id="app" class="app-shell">
+    <section id="auth-screen" class="auth-screen">
+      <div class="auth-brand"><span class="brand-mark">P</span><span>PrintFlow<span class="brand-light"> POS</span></span></div>
+      <div class="auth-card">
+        <div class="auth-heading">
+          <p class="eyebrow">YOUR COUNTER, IN CONTROL</p>
+          <h1 id="auth-title">Welcome back</h1>
+          <p id="auth-subtitle">Sign in to start serving customers.</p>
+        </div>
+        <form id="login-form" class="form-stack">
+          <label>Email address<input name="email" type="email" autocomplete="email" required placeholder="you@printshop.com"></label>
+          <label>Password<input name="password" type="password" autocomplete="current-password" required placeholder="Enter your password"></label>
+          <button class="text-button align-right" type="button" data-action="forgot-password">Forgot password?</button>
+          <button class="button primary full" type="submit">Sign in</button>
+        </form>
+        <form id="register-form" class="form-stack hidden">
+          <div class="form-grid">
+            <label>Full name<input name="full_name" autocomplete="name" required placeholder="Your name"></label>
+            <label>Phone number<input name="phone" type="tel" autocomplete="tel" required placeholder="Phone number"></label>
+          </div>
+          <label>Email address<input name="email" type="email" autocomplete="email" required placeholder="you@printshop.com"></label>
+          <label>Password<input name="password" type="password" autocomplete="new-password" minlength="8" required placeholder="At least 8 characters"></label>
+          <label>Quick PIN <span class="label-hint">Used to remove draft cart items</span><input name="pin" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" autocomplete="off" required placeholder="4 digits"></label>
+          <button class="button primary full" type="submit">Create account</button>
+          <p class="muted small">New accounts need admin approval before using the POS.</p>
+        </form>
+        <form id="recovery-form" class="form-stack hidden">
+          <label>New password<input name="password" type="password" autocomplete="new-password" minlength="8" required placeholder="At least 8 characters"></label>
+          <button class="button primary full" type="submit">Update password</button>
+        </form>
+        <p class="auth-switch"><span id="auth-switch-copy">New to PrintFlow?</span> <button class="text-button" type="button" data-action="toggle-auth" id="auth-switch-button">Create an account</button></p>
+        <p id="auth-message" class="notice hidden" role="status"></p>
+      </div>
+      <p class="auth-footnote">Simple, reliable print shop management.</p>
+    </section>
+
+    <section id="main-screen" class="main-screen hidden">
+      <header class="topbar">
+        <a href="#" class="app-brand" aria-label="PrintFlow POS home"><span class="brand-mark">P</span><span>PrintFlow <span class="brand-light">POS</span></span></a>
+        <div class="header-actions">
+          <span id="role-badge" class="role-badge"></span>
+          <button class="icon-button inventory-shortcut" type="button" data-action="open-inventory" aria-label="Open inventory">▤<span class="desktop-label">Inventory</span></button>
+          <div class="user-menu"><span id="user-initial" class="avatar">P</span><span id="user-name" class="user-name"></span><button class="text-button" type="button" data-action="sign-out">Sign out</button></div>
+        </div>
+      </header>
+
+      <div id="low-stock-alert" class="low-stock-alert hidden" role="alert"></div>
+
+      <nav id="admin-nav" class="section-nav hidden" aria-label="Management">
+        <button class="nav-tab active" type="button" data-section="pos">Point of sale</button>
+        <button class="nav-tab" type="button" data-section="management">Management <span id="pending-count" class="count-pill hidden">0</span></button>
+        <button class="nav-tab" type="button" data-section="history">Bills &amp; reports</button>
+      </nav>
+
+      <section id="pos-section" class="workspace">
+        <div class="pos-catalog">
+          <div class="section-heading">
+            <div><p class="eyebrow">QUICK CHECKOUT</p><h1>New bill</h1><p class="subheading">Choose a service, then enter pages and copies.</p></div>
+            <span class="stock-mini" id="stock-summary"></span>
+          </div>
+          <div id="category-tabs" class="category-tabs" role="tablist" aria-label="Service category">
+            <button class="category-tab active" type="button" role="tab" aria-selected="true" data-category="printout">Printouts</button>
+            <button class="category-tab" type="button" role="tab" aria-selected="false" data-category="photocopy">Photocopies</button>
+            <button class="category-tab" type="button" role="tab" aria-selected="false" data-category="other">Other services</button>
+          </div>
+          <div id="service-grid" class="service-grid" aria-live="polite"></div>
+        </div>
+
+        <aside class="cart-panel" aria-label="Current bill">
+          <div class="cart-heading"><div><p class="eyebrow">CURRENT ORDER</p><h2>Bill summary</h2></div><span id="cart-count" class="cart-count">0 items</span></div>
+          <div id="cart-items" class="cart-items"><div class="empty-cart"><span class="empty-icon">＋</span><strong>Your cart is empty</strong><span>Tap a service to add it to this bill.</span></div></div>
+          <div class="cart-footer">
+            <div class="cart-total"><span>Total</span><strong id="cart-total">₹0.00</strong></div>
+            <button id="checkout-button" class="button primary full checkout-button" type="button" disabled>Complete bill <span aria-hidden="true">→</span></button>
+            <p class="cart-footnote">Paper stock updates automatically at checkout.</p>
+          </div>
+        </aside>
+      </section>
+
+      <section id="management-section" class="dashboard-section hidden">
+        <div class="section-heading"><div><p class="eyebrow">SHOP SETTINGS</p><h1>Management</h1><p class="subheading">Review accounts and stock requests, or update your service prices.</p></div></div>
+        <div class="dashboard-grid">
+          <article class="panel"><div class="panel-title"><div><h2>Account approvals</h2><p>Approve new teammates before they can use the POS.</p></div></div><div id="pending-users" class="list-content"></div></article>
+          <article class="panel"><div class="panel-title"><div><h2>Stock requests</h2><p>Staff replenishment requests awaiting review.</p></div></div><div id="stock-requests" class="list-content"></div></article>
+          <article class="panel price-panel"><div class="panel-title"><div><h2>Service prices</h2><p>Prices are applied and validated at checkout.</p></div></div><div id="service-prices" class="list-content"></div></article>
+          <article class="panel"><div class="panel-title"><div><h2>Team</h2><p>Manage approved staff and administrator access.</p></div></div><div id="team-list" class="list-content"></div></article>
+        </div>
+      </section>
+
+      <section id="history-section" class="dashboard-section hidden">
+        <div class="section-heading"><div><p class="eyebrow">TRANSACTION RECORD</p><h1>Bills &amp; reports</h1><p class="subheading">Completed bills, cancellation requests, and audit-safe voids.</p></div><button class="button secondary" type="button" data-action="refresh-history">Refresh</button></div>
+        <div class="panel history-panel"><div id="bill-history" class="list-content"></div></div>
+      </section>
+      <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+    </section>
+  </main>
+
+  <dialog id="inventory-dialog" class="dialog-card">
+    <form method="dialog" class="dialog-dismiss"><button class="icon-button" aria-label="Close inventory">×</button></form>
+    <p class="eyebrow">PAPER STOCK</p><h2>Inventory</h2><p class="dialog-intro">Track exact sheet counts. Staff additions are sent for approval.</p>
+    <div id="inventory-balances" class="inventory-balances"></div>
+    <form id="stock-form" class="form-stack">
+      <label>Paper size<select name="paper_size"><option value="A4">A4 paper</option><option value="A5">A5 paper</option></select></label>
+      <label>Sheets to add<input name="sheets" type="number" inputmode="numeric" min="1" step="1" required placeholder="e.g. 500"></label>
+      <label>Note <span class="label-hint">Optional</span><input name="note" maxlength="300" placeholder="Supplier or delivery note"></label>
+      <button class="button primary full" type="submit">Add sheets / request approval</button>
+    </form>
+    <p id="inventory-message" class="muted small"></p>
+  </dialog>
+
+  <dialog id="pin-dialog" class="dialog-card compact-dialog">
+    <form method="dialog" class="dialog-dismiss"><button class="icon-button" aria-label="Close">×</button></form>
+    <div class="modal-icon pin-icon">●</div><p class="eyebrow">PIN VERIFICATION</p><h2>Confirm it's you</h2><p id="pin-description" class="dialog-intro">Enter your PIN or an administrator PIN to remove this draft item.</p>
+    <form id="pin-form" class="form-stack">
+      <label>4-digit PIN<input name="pin" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" autocomplete="off" required placeholder="••••"></label>
+      <button class="button primary full" type="submit">Verify PIN</button>
+      <button class="button quiet full" type="button" data-action="close-pin">Cancel</button>
+    </form>
+  </dialog>
+
+  <dialog id="danger-dialog" class="dialog-card danger-dialog">
+    <form method="dialog" class="dialog-dismiss"><button class="icon-button" aria-label="Close">×</button></form>
+    <div class="modal-icon danger-icon">!</div><p class="eyebrow danger-eyebrow">DESTRUCTIVE ACTION</p><h2 id="danger-title">Confirm this action</h2><p id="danger-impact" class="dialog-intro"></p>
+    <form id="danger-form" class="form-stack">
+      <label id="danger-reason-label">Reason<input name="reason" maxlength="500" required placeholder="Explain why this action is needed"></label>
+      <label id="danger-pin-label" class="hidden">Administrator PIN<input name="pin" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" autocomplete="off" placeholder="4 digits"></label>
+      <button id="danger-confirm" class="button danger-button full" type="submit">Confirm action</button>
+      <button class="button quiet full" type="button" data-action="close-danger">Cancel</button>
+    </form>
+  </dialog>
+
+  <dialog id="price-dialog" class="dialog-card compact-dialog">
+    <form method="dialog" class="dialog-dismiss"><button class="icon-button" aria-label="Close">×</button></form>
+    <p class="eyebrow">SERVICE PRICE</p><h2 id="price-title">Update price</h2>
+    <form id="price-form" class="form-stack">
+      <label>Unit price<input name="unit_price" type="number" inputmode="decimal" min="0" step="0.01" required></label>
+      <button class="button primary full" type="submit">Save price</button>
+    </form>
+  </dialog>
+</body>
+</html>
