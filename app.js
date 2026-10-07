@@ -121,7 +121,6 @@
       state.paymentTouched = true;
       renderSettlement();
     });
-    $("#save-credit").addEventListener("change", renderSettlement);
     $("#category-tabs").addEventListener("click", event => {
       const button = event.target.closest("[data-category]");
       if (!button) return;
@@ -234,7 +233,6 @@
     el.customerSearch.value = "";
     $("#customer-options").replaceChildren();
     el.customerBalance.classList.add("hidden");
-    $("#save-credit").checked = false;
     renderCart();
   }
 
@@ -478,6 +476,132 @@
     return (service.side_type === "double" ? Math.ceil(pages / 2) : pages) * copies;
   }
 
+  function createBillPdf(receipt) {
+    const JsPDF = window.jspdf?.jsPDF;
+    if (!JsPDF) throw new Error("The PDF generator did not load. Check your internet connection and try again.");
+
+    const doc = new JsPDF({ unit: "mm", format: "a4" });
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const left = 16;
+    const right = pageWidth - left;
+    const printableWidth = right - left;
+    let y = 18;
+
+    const ensureSpace = (height = 8) => {
+      if (y + height > pageHeight - 16) {
+        doc.addPage();
+        y = 18;
+      }
+    };
+    const addLabelValue = (label, value, bold = false) => {
+      ensureSpace();
+      doc.setFont("helvetica", bold ? "bold" : "normal");
+      doc.text(String(label), left, y);
+      doc.text(String(value), right, y, { align: "right" });
+      y += 7;
+    };
+
+    doc.setFillColor(15, 23, 42);
+    doc.roundedRect(left, y, printableWidth, 34, 3, 3, "F");
+    doc.setTextColor(248, 250, 252);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(19);
+    doc.text("PrintFlow POS", left + 7, y + 13);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.setTextColor(191, 219, 254);
+    doc.text("SALES RECEIPT", left + 7, y + 23);
+    doc.setTextColor(226, 232, 240);
+    doc.text(receipt.billNumber, right - 7, y + 13, { align: "right" });
+    doc.text(receipt.createdAt.toLocaleString(), right - 7, y + 23, { align: "right" });
+    y += 44;
+
+    doc.setTextColor(71, 85, 105);
+    doc.setFontSize(9);
+    addLabelValue("Customer", receipt.customerName, true);
+    addLabelValue("Cashier", state.profile?.full_name || "Staff");
+    y += 3;
+
+    doc.setFillColor(241, 245, 249);
+    doc.rect(left, y - 2, printableWidth, 9, "F");
+    doc.setTextColor(51, 65, 85);
+    doc.setFont("helvetica", "bold");
+    doc.text("ITEM", left + 2, y + 4);
+    doc.text("QTY", right - 45, y + 4, { align: "right" });
+    doc.text("RATE", right - 23, y + 4, { align: "right" });
+    doc.text("TOTAL", right - 2, y + 4, { align: "right" });
+    y += 12;
+
+    doc.setFontSize(9);
+    receipt.items.forEach(item => {
+      const title = `${item.name} (${item.sideType}, ${item.paperSize})`;
+      const titleLines = doc.splitTextToSize(title, printableWidth - 62);
+      const lineHeight = Math.max(8, titleLines.length * 4.5);
+      ensureSpace(lineHeight + 4);
+      doc.setFont("helvetica", "normal");
+      doc.setTextColor(30, 41, 59);
+      doc.text(titleLines, left + 2, y);
+      doc.text(String(item.pages * item.copies), right - 45, y, { align: "right" });
+      doc.text(currency(item.unitPrice), right - 23, y, { align: "right" });
+      doc.text(currency(item.lineTotal), right - 2, y, { align: "right" });
+      y += lineHeight;
+      doc.setDrawColor(226, 232, 240);
+      doc.line(left, y, right, y);
+      y += 4;
+    });
+
+    y += 2;
+    doc.setTextColor(51, 65, 85);
+    addLabelValue("Subtotal", currency(receipt.total), true);
+    if (receipt.previousBalance !== 0) {
+      addLabelValue("Previous balance", currency(receipt.previousBalance));
+    }
+    addLabelValue("Amount paid", currency(receipt.amountPaid));
+    if (receipt.changeDue > 0.005) {
+      addLabelValue("Change", currency(receipt.changeDue));
+    }
+
+    ensureSpace(20);
+    const balance = Number(receipt.newBalance) || 0;
+    const balanceLabel = balance > 0.005 ? "DUE" : balance < -0.005 ? "OVERPAID" : "BALANCE";
+    const balanceColor = balance > 0.005 ? [185, 28, 28] : balance < -0.005 ? [4, 120, 87] : [30, 41, 59];
+    doc.setFillColor(241, 245, 249);
+    doc.roundedRect(left, y, printableWidth, 17, 2, 2, "F");
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(12);
+    doc.setTextColor(...balanceColor);
+    doc.text(balanceLabel, left + 4, y + 11);
+    doc.text(currency(Math.abs(balance)), right - 4, y + 11, { align: "right" });
+    y += 28;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.setTextColor(100, 116, 139);
+    doc.text("Thank you for choosing PrintFlow.", pageWidth / 2, y, { align: "center" });
+
+    return doc.output("blob");
+  }
+
+  function openBillPdf(receipt, pdfWindow) {
+    try {
+      const blob = createBillPdf(receipt);
+      const url = URL.createObjectURL(blob);
+      if (pdfWindow && !pdfWindow.closed) {
+        pdfWindow.location.replace(url);
+      } else {
+        const download = document.createElement("a");
+        download.href = url;
+        download.download = `${receipt.billNumber}.pdf`;
+        download.click();
+        notify("Receipt PDF downloaded. Allow pop-ups to open the PDF in a new tab.");
+      }
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (error) {
+      if (pdfWindow && !pdfWindow.closed) pdfWindow.close();
+      notify(`Bill was completed, but the PDF could not be generated: ${asError(error)}`, true);
+    }
+  }
+
   function updateCartInput(event) {
     const input = event.target.closest("[data-field]");
     if (!input) return;
@@ -507,14 +631,16 @@
     const due = netPayable();
     const paid = Math.max(0, Number(el.amountPaid.value) || 0);
     const previous = previousCustomerBalance();
-    const saveCredit = $("#save-credit").checked;
-    const applied = saveCredit ? paid : Math.min(paid, due);
+    const enteredName = el.customerSearch.value.trim();
+    const hasLedgerCustomer = Boolean(state.selectedCustomer)
+      || Boolean(enteredName && !["walk-in", "cash customer"].includes(enteredName.toLowerCase()));
+    const applied = hasLedgerCustomer ? paid : Math.min(paid, due);
     const nextBalance = previous + subtotal() - applied;
     let settlement = `Net payable: ${currency(due)}`;
     if (paid < due) settlement += ` · Remaining: ${currency(due - paid)}`;
-    else if (paid > due && !saveCredit) settlement += ` · Change due: ${currency(paid - due)}`;
-    else if (paid > due) settlement += ` · Customer credit: ${currency(Math.abs(nextBalance))}`;
-    if (nextBalance > 0.005) settlement += ` · New debit: ${currency(nextBalance)}`;
+    else if (paid > due && !hasLedgerCustomer) settlement += ` · Change due: ${currency(paid - due)}`;
+    else if (paid > due && hasLedgerCustomer) settlement += ` · OVERPAID: ${currency(Math.abs(nextBalance))}`;
+    if (nextBalance > 0.005) settlement += ` · DUE: ${currency(nextBalance)}`;
     el.settlementSummary.textContent = settlement;
   }
 
@@ -583,11 +709,11 @@
         return;
       }
       el.customerBalance.textContent = balance > 0
-        ? `Customer owes ${currency(balance)}`
+        ? `DUE: ${currency(balance)}`
         : balance < 0
-          ? `Available Credit: ${currency(Math.abs(balance))}`
+          ? `OVERPAID: ${currency(Math.abs(balance))}`
           : "No outstanding balance";
-      el.customerBalance.className = `customer-balance${balance > 0 ? " debit" : balance < 0 ? " credit" : ""}`;
+      el.customerBalance.className = `customer-balance${balance > 0 ? " due" : balance < 0 ? " overpaid" : ""}`;
     } else {
       state.selectedCustomer = null;
       state.customerPhone = "";
@@ -713,6 +839,28 @@
       el.amountPaid.focus();
       return notify("Enter a valid amount paid.", true);
     }
+    const cartSnapshot = state.cart.map(row => {
+      const service = getService(row.serviceId);
+      return {
+        name: service?.name || "Service",
+        paperSize: service?.paper_size === "none" ? "No paper" : service?.paper_size || "No paper",
+        sideType: service?.side_type === "double" ? "Double-sided" : "Single-sided",
+        pages: row.pages,
+        copies: row.copies,
+        unitPrice: Number(row.unitPrice ?? service?.unit_price) || 0,
+        lineTotal: rowTotal(row)
+      };
+    });
+    let pdfWindow = null;
+    try {
+      pdfWindow = window.open("about:blank", "_blank");
+      if (pdfWindow) {
+        pdfWindow.document.title = "Preparing PrintFlow receipt";
+        pdfWindow.document.body.textContent = "Preparing your receipt PDF...";
+      }
+    } catch {
+      pdfWindow = null;
+    }
     setBusy(el.checkoutButton, true);
     try {
       let result;
@@ -723,14 +871,26 @@
           p_customer_name: customerName,
           p_customer_phone: state.customerPhone || null,
           p_amount_paid: paid,
-          p_save_credit: $("#save-credit").checked,
           p_pin: state.verifiedPricePin
         });
         if (!result?.id) throw new Error("The bill was created without a returned ID. Please refresh Bills & Reports.");
       } catch (error) {
+        if (pdfWindow && !pdfWindow.closed) pdfWindow.close();
         notify(asError(error), true);
         return;
       }
+      openBillPdf({
+        billNumber: result.bill_number,
+        customerName,
+        createdAt: new Date(),
+        total: Number(result.total),
+        previousBalance: Number(result.previous_balance) || 0,
+        amountPaid: Number(result.amount_paid) || 0,
+        newBalance: state.selectedCustomer ? Number(result.new_balance) || 0 : 0,
+        changeDue: Math.max(0, paid - (Number(result.amount_paid) || 0)),
+        items: cartSnapshot
+      }, pdfWindow);
+      pdfWindow = null;
       state.cart = [];
       state.selectedCustomer = null;
       state.customerPhone = "";
@@ -739,7 +899,6 @@
       state.verifiedPricePin = null;
       el.customerSearch.value = "";
       $("#customer-options").replaceChildren();
-      $("#save-credit").checked = false;
       el.customerBalance.classList.add("hidden");
       renderCart();
       notify(`Bill ${result.bill_number} completed · ${currency(result.total)}`);
@@ -901,7 +1060,7 @@
     $("#customer-ledger").innerHTML = customers.length ? customers.map(customer => `
       <button class="list-row ledger-row" type="button" data-customer-id="${escapeHtml(customer.id)}">
         <span class="list-primary">${escapeHtml(customer.name)}<span class="list-secondary">${escapeHtml(customer.customer_code)} · ${escapeHtml(customer.phone || "No phone")}</span></span>
-        <span class="ledger-balance${Number(customer.balance) > 0 ? " debit" : Number(customer.balance) < 0 ? " credit" : ""}">${Number(customer.balance) > 0 ? "Debit " : Number(customer.balance) < 0 ? "Credit " : ""}${currency(Math.abs(Number(customer.balance)))}</span>
+        <span class="ledger-balance${Number(customer.balance) > 0 ? " due" : Number(customer.balance) < 0 ? " overpaid" : ""}">${Number(customer.balance) > 0 ? "DUE " : Number(customer.balance) < 0 ? "OVERPAID " : ""}${currency(Math.abs(Number(customer.balance)))}</span>
       </button>`).join("") : '<div class="empty-list">No registered customer accounts yet.</div>';
   }
 

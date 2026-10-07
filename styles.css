@@ -244,8 +244,8 @@ h1, h2 { font-family: Manrope, sans-serif; letter-spacing: -.8px; }
 .customer-search-row input, .payment-fields input { width: 100%; min-width: 0; min-height: 44px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: white; font-size: 13px; }
 .customer-search-row .small-button { min-width: 53px; }
 .customer-balance { padding: 9px 11px; border-radius: 8px; color: #5e6b7d; background: #f0f3f8; font-size: 12px; font-weight: 700; }
-.customer-balance.debit, .ledger-balance.debit { color: #a54d09; background: var(--amber-soft); }
-.customer-balance.credit, .ledger-balance.credit { color: #177353; background: var(--green-soft); }
+.customer-balance.due, .ledger-balance.due { color: #b91c1c; background: #fee2e2; }
+.customer-balance.overpaid, .ledger-balance.overpaid { color: #047857; background: #d1fae5; }
 .payment-fields { display: grid; grid-template-columns: 1fr 1fr; align-items: center; gap: 10px; }
 .checkbox-label { display: flex; align-items: center; gap: 8px; color: #68758a; font-size: 11px; }
 .checkbox-label input { width: 17px; height: 17px; accent-color: var(--primary); }
@@ -491,12 +491,12 @@ input[type="number"] { font-variant-numeric: tabular-nums; }
 .service-preview > strong { color: #93c5fd; }
 .customer-fields { background: #1b293c; }
 .customer-balance { color: #cbd5e1; background: #334155; }
-.customer-balance.debit, .ledger-balance.debit {
-  border: 1px solid rgba(245, 158, 11, .3);
-  color: #fcd34d;
-  background: rgba(245, 158, 11, .15);
+.customer-balance.due, .ledger-balance.due {
+  border: 1px solid rgba(239, 68, 68, .4);
+  color: #fca5a5;
+  background: rgba(239, 68, 68, .16);
 }
-.customer-balance.credit, .ledger-balance.credit {
+.customer-balance.overpaid, .ledger-balance.overpaid {
   border: 1px solid rgba(16, 185, 129, .3);
   color: #6ee7b7;
   background: rgba(16, 185, 129, .15);

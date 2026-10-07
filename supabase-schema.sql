@@ -303,6 +303,7 @@ begin
 end
 $$;
 
+drop function if exists public.create_bill(jsonb, uuid, text, text, numeric, boolean, text);
 drop function if exists public.create_bill(jsonb);
 create or replace function public.create_bill(
   p_items jsonb,
@@ -310,7 +311,6 @@ create or replace function public.create_bill(
   p_customer_name text default null,
   p_customer_phone text default null,
   p_amount_paid numeric default 0,
-  p_save_credit boolean default false,
   p_pin text default null
 )
 returns jsonb
@@ -341,7 +341,6 @@ begin
   if p_amount_paid is null or p_amount_paid < 0 or p_amount_paid > 99999999 then
     raise exception 'Enter a valid amount paid';
   end if;
-  if p_save_credit is null then raise exception 'Choose how to handle overpayment'; end if;
   if p_items is null or jsonb_typeof(p_items) <> 'array' then
     raise exception 'Bill items must be a JSON array';
   end if;
@@ -356,10 +355,9 @@ begin
       raise exception 'The selected customer name does not match the ledger account';
     end if;
     v_previous_balance := v_customer.balance;
-  elsif nullif(trim(p_customer_phone), '') is not null
-     and lower(trim(p_customer_name)) not in ('walk-in', 'cash customer') then
+  elsif lower(trim(p_customer_name)) not in ('walk-in', 'cash customer') then
     insert into public.customers(customer_code, name, phone)
-    values ('CUST-' || nextval('public.customer_code_seq')::text, trim(p_customer_name), trim(p_customer_phone))
+    values ('CUST-' || nextval('public.customer_code_seq')::text, trim(p_customer_name), nullif(trim(p_customer_phone), ''))
     returning * into v_customer;
     p_customer_id := v_customer.id;
   end if;
@@ -424,7 +422,7 @@ begin
   end loop;
 
   v_amount_applied := case
-    when p_save_credit then p_amount_paid
+    when p_customer_id is not null then p_amount_paid
     else least(p_amount_paid, greatest(0, v_total + v_previous_balance))
   end;
   v_new_balance := v_previous_balance + v_total - v_amount_applied;
@@ -779,7 +777,7 @@ revoke all on function public.current_role() from public, anon;
 revoke all on function public.is_approved_user() from public, anon;
 revoke all on function public.is_admin() from public, anon;
 revoke all on function public.verify_pos_pin(text) from public, anon;
-revoke all on function public.create_bill(jsonb, uuid, text, text, numeric, boolean, text) from public, anon;
+revoke all on function public.create_bill(jsonb, uuid, text, text, numeric, text) from public, anon;
 revoke all on function public.add_paper_stock(public.paper_size, bigint, text) from public, anon;
 revoke all on function public.resolve_stock_request(uuid, boolean, text) from public, anon;
 revoke all on function public.request_bill_cancellation(uuid, text) from public, anon;
@@ -796,7 +794,7 @@ grant execute on function public.current_role() to authenticated;
 grant execute on function public.is_approved_user() to authenticated;
 grant execute on function public.is_admin() to authenticated;
 grant execute on function public.verify_pos_pin(text) to authenticated;
-grant execute on function public.create_bill(jsonb, uuid, text, text, numeric, boolean, text) to authenticated;
+grant execute on function public.create_bill(jsonb, uuid, text, text, numeric, text) to authenticated;
 grant execute on function public.add_paper_stock(public.paper_size, bigint, text) to authenticated;
 grant execute on function public.resolve_stock_request(uuid, boolean, text) to authenticated;
 grant execute on function public.request_bill_cancellation(uuid, text) to authenticated;
