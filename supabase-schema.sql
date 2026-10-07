@@ -92,10 +92,26 @@ create table if not exists public.stock_requests (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.customers (
+  id uuid primary key default gen_random_uuid(),
+  customer_code varchar(32) not null unique,
+  name text not null,
+  phone text,
+  balance numeric(10,2) not null default 0.00,
+  created_at timestamptz not null default now()
+);
+create sequence if not exists public.customer_code_seq start with 1001;
+
 create table if not exists public.bills (
   id uuid primary key default gen_random_uuid(),
   bill_number text not null unique,
   created_by uuid references auth.users(id) on delete set null,
+  billed_by uuid,
+  customer_id uuid references public.customers(id) on delete set null,
+  customer_name text not null default 'Walk-in',
+  previous_balance numeric(10,2) not null default 0.00,
+  amount_paid numeric(10,2) not null default 0.00,
+  new_balance numeric(10,2) not null default 0.00,
   total numeric(12,2) not null check (total >= 0),
   status public.bill_status not null default 'completed',
   cancellation_reason text,
@@ -104,6 +120,25 @@ create table if not exists public.bills (
   cancelled_at timestamptz,
   created_at timestamptz not null default now()
 );
+
+alter table public.bills add column if not exists billed_by uuid;
+alter table public.bills add column if not exists customer_id uuid references public.customers(id) on delete set null;
+alter table public.bills add column if not exists customer_name text not null default 'Walk-in';
+alter table public.bills add column if not exists previous_balance numeric(10,2) not null default 0.00;
+alter table public.bills add column if not exists amount_paid numeric(10,2) not null default 0.00;
+alter table public.bills add column if not exists new_balance numeric(10,2) not null default 0.00;
+alter table public.bills drop constraint if exists bills_customer_id_fkey;
+alter table public.bills add constraint bills_customer_id_fkey
+  foreign key (customer_id) references public.customers(id) on delete set null;
+alter table public.stock_requests add column if not exists requested_by uuid;
+alter table public.stock_requests drop constraint if exists fk_stock_requests_profiles;
+alter table public.stock_requests add constraint fk_stock_requests_profiles
+  foreign key (requested_by) references public.profiles(id) on delete set null;
+alter table public.bills drop constraint if exists fk_bills_profiles;
+alter table public.bills add constraint fk_bills_profiles
+  foreign key (billed_by) references public.profiles(id) on delete set null;
+update public.bills b set billed_by = b.created_by
+where b.billed_by is null and exists (select 1 from public.profiles p where p.id = b.created_by);
 
 create table if not exists public.bill_items (
   id uuid primary key default gen_random_uuid(),
@@ -228,7 +263,8 @@ values
   ('A5 Photocopy B/W · Single sided', 'photocopy', 'A5', 'single', 0.75),
   ('A5 Photocopy B/W · Double sided', 'photocopy', 'A5', 'double', 1.25),
   ('A5 Photocopy Color · Single sided', 'photocopy', 'A5', 'single', 6.00),
-  ('A5 Photocopy Color · Double sided', 'photocopy', 'A5', 'double', 10.00)
+  ('A5 Photocopy Color · Double sided', 'photocopy', 'A5', 'double', 10.00),
+  ('Typesetting', 'other', 'none', 'single', 0.00)
 on conflict (name, category) do nothing;
 
 create or replace function public.verify_pos_pin(p_pin text)
@@ -267,7 +303,16 @@ begin
 end
 $$;
 
-create or replace function public.create_bill(p_items jsonb)
+drop function if exists public.create_bill(jsonb);
+create or replace function public.create_bill(
+  p_items jsonb,
+  p_customer_id uuid default null,
+  p_customer_name text default null,
+  p_customer_phone text default null,
+  p_amount_paid numeric default 0,
+  p_save_credit boolean default false,
+  p_pin text default null
+)
 returns jsonb
 language plpgsql security definer
 set search_path = ''
@@ -275,9 +320,15 @@ as $$
 declare
   v_item jsonb;
   v_service public.services%rowtype;
+  v_customer public.customers%rowtype;
   v_bill_id uuid := gen_random_uuid();
   v_bill_number text;
   v_total numeric(12,2) := 0;
+  v_unit_price numeric(12,2);
+  v_previous_balance numeric(10,2) := 0;
+  v_amount_applied numeric(10,2);
+  v_new_balance numeric(10,2) := 0;
+  v_has_custom_print_price boolean := false;
   v_pages integer;
   v_copies integer;
   v_line_total numeric(12,2);
@@ -286,6 +337,11 @@ declare
   v_result_items jsonb := '[]'::jsonb;
 begin
   if not public.is_approved_user() then raise exception 'Approved account required'; end if;
+  if nullif(trim(p_customer_name), '') is null then raise exception 'Customer name is required'; end if;
+  if p_amount_paid is null or p_amount_paid < 0 or p_amount_paid > 99999999 then
+    raise exception 'Enter a valid amount paid';
+  end if;
+  if p_save_credit is null then raise exception 'Choose how to handle overpayment'; end if;
   if p_items is null or jsonb_typeof(p_items) <> 'array' then
     raise exception 'Bill items must be a JSON array';
   end if;
@@ -293,9 +349,27 @@ begin
     raise exception 'Bill must contain between 1 and 100 items';
   end if;
 
+  if p_customer_id is not null then
+    select * into v_customer from public.customers where id = p_customer_id for update;
+    if not found then raise exception 'Selected customer no longer exists'; end if;
+    if lower(trim(p_customer_name)) <> lower(v_customer.name) then
+      raise exception 'The selected customer name does not match the ledger account';
+    end if;
+    v_previous_balance := v_customer.balance;
+  elsif nullif(trim(p_customer_phone), '') is not null
+     and lower(trim(p_customer_name)) not in ('walk-in', 'cash customer') then
+    insert into public.customers(customer_code, name, phone)
+    values ('CUST-' || nextval('public.customer_code_seq')::text, trim(p_customer_name), trim(p_customer_phone))
+    returning * into v_customer;
+    p_customer_id := v_customer.id;
+  end if;
+
   v_bill_number := 'PF-' || to_char(clock_timestamp(), 'YYMMDD') || '-' || upper(substr(replace(v_bill_id::text, '-', ''), 1, 8));
-  insert into public.bills(id, bill_number, created_by, total, status)
-  values (v_bill_id, v_bill_number, auth.uid(), 0, 'completed');
+  insert into public.bills(id, bill_number, created_by, billed_by, customer_id, customer_name,
+    previous_balance, amount_paid, new_balance, total, status)
+  values (v_bill_id, v_bill_number, auth.uid(), auth.uid(), p_customer_id, trim(p_customer_name),
+    v_previous_balance, p_amount_paid, v_previous_balance, 0, 'completed')
+  returning id into v_bill_id;
 
   for v_item in select value from jsonb_array_elements(p_items)
   loop
@@ -310,7 +384,15 @@ begin
     v_pages := (v_item ->> 'pages')::integer;
     v_copies := (v_item ->> 'copies')::integer;
     if v_pages::bigint * v_copies::bigint > 10000000 then raise exception 'Page/copy quantity is too large'; end if;
-    v_line_total := v_service.unit_price * v_pages * v_copies;
+    v_unit_price := coalesce(nullif(v_item ->> 'unit_price', '')::numeric, v_service.unit_price);
+    if v_unit_price < 0 or v_unit_price > 999999 then raise exception 'Invalid service price'; end if;
+    if v_service.category = 'photocopy' and v_unit_price <> v_service.unit_price then
+      raise exception 'Photocopy prices are fixed by the service price configuration';
+    end if;
+    if v_service.category = 'printout' and v_unit_price <> v_service.unit_price then
+      v_has_custom_print_price := true;
+    end if;
+    v_line_total := v_unit_price * v_pages * v_copies;
     v_total := v_total + v_line_total;
     v_sheets := case
       when v_service.paper_size = 'none' then 0
@@ -319,13 +401,16 @@ begin
     end;
     if v_service.paper_size in ('A4', 'A5') then
       insert into public.bill_items(bill_id, service_id, service_name, category, paper_size, side_type, pages, copies, unit_price, line_total, sheets_used)
-      values (v_bill_id, v_service.id, v_service.name, v_service.category, v_service.paper_size, v_service.side_type, v_pages, v_copies, v_service.unit_price, v_line_total, v_sheets);
+      values (v_bill_id, v_service.id, v_service.name, v_service.category, v_service.paper_size, v_service.side_type, v_pages, v_copies, v_unit_price, v_line_total, v_sheets);
     else
       insert into public.bill_items(bill_id, service_id, service_name, category, paper_size, side_type, pages, copies, unit_price, line_total, sheets_used)
-      values (v_bill_id, v_service.id, v_service.name, v_service.category, v_service.paper_size, v_service.side_type, v_pages, v_copies, v_service.unit_price, v_line_total, 0);
+      values (v_bill_id, v_service.id, v_service.name, v_service.category, v_service.paper_size, v_service.side_type, v_pages, v_copies, v_unit_price, v_line_total, 0);
     end if;
     v_result_items := v_result_items || jsonb_build_array(jsonb_build_object('service', v_service.name, 'pages', v_pages, 'copies', v_copies, 'total', v_line_total, 'sheets', v_sheets));
   end loop;
+  if v_has_custom_print_price and not public.verify_pos_pin(p_pin) then
+    raise exception 'A valid staff PIN is required for a custom printout price';
+  end if;
 
   for v_size in select paper from (values ('A4'::public.paper_size), ('A5'::public.paper_size)) as sizes(paper) order by paper
   loop
@@ -338,10 +423,20 @@ begin
     end if;
   end loop;
 
-  update public.bills set total = v_total where id = v_bill_id;
+  v_amount_applied := case
+    when p_save_credit then p_amount_paid
+    else least(p_amount_paid, greatest(0, v_total + v_previous_balance))
+  end;
+  v_new_balance := v_previous_balance + v_total - v_amount_applied;
+  if p_customer_id is not null then
+    update public.customers set balance = v_new_balance where id = p_customer_id;
+  end if;
+  update public.bills set total = v_total, amount_paid = v_amount_applied, new_balance = v_new_balance
+  where id = v_bill_id;
   insert into public.audit_logs(actor_id, action, entity_type, entity_id, details)
   values (auth.uid(), 'bill_created', 'bill', v_bill_id::text, jsonb_build_object('total', v_total, 'items', v_result_items));
-  return jsonb_build_object('id', v_bill_id, 'bill_number', v_bill_number, 'total', v_total);
+  return jsonb_build_object('id', v_bill_id, 'bill_number', v_bill_number, 'total', v_total,
+    'previous_balance', v_previous_balance, 'amount_paid', v_amount_applied, 'new_balance', v_new_balance);
 end
 $$;
 
@@ -420,6 +515,62 @@ begin
 end
 $$;
 
+drop function if exists public.search_customers(text);
+create or replace function public.search_customers(p_query text)
+returns table(id uuid, customer_code varchar, name text, phone text)
+language plpgsql security definer
+set search_path = ''
+as $$
+begin
+  if not public.is_approved_user() then raise exception 'Approved account required'; end if;
+  if nullif(trim(p_query), '') is null then return; end if;
+  return query
+  select c.id, c.customer_code, c.name, c.phone
+  from public.customers c
+  where c.customer_code ilike '%' || trim(p_query) || '%'
+     or c.name ilike '%' || trim(p_query) || '%'
+     or coalesce(c.phone, '') ilike '%' || trim(p_query) || '%'
+  order by c.name
+  limit 20;
+end
+$$;
+
+create or replace function public.get_customer_balance(p_customer_id uuid)
+returns numeric
+language plpgsql security definer
+set search_path = ''
+as $$
+declare v_balance numeric(10,2);
+begin
+  if not public.is_approved_user() then raise exception 'Approved account required'; end if;
+  select balance into v_balance from public.customers where id = p_customer_id;
+  if not found then raise exception 'Customer no longer exists'; end if;
+  return v_balance;
+end
+$$;
+
+create or replace function public.admin_reset_pin(p_user_id uuid, p_new_pin text, p_admin_pin text)
+returns void
+language plpgsql security definer
+set search_path = ''
+as $$
+declare v_target public.profiles%rowtype;
+begin
+  if not public.is_admin() then raise exception 'Administrator access required'; end if;
+  if coalesce(p_new_pin, '') !~ '^[0-9]{4}$' or not public.verify_pos_pin(p_admin_pin) then
+    raise exception 'Enter a valid new four-digit PIN and administrator PIN';
+  end if;
+  select * into v_target from public.profiles where id = p_user_id for update;
+  if not found or v_target.role = 'super_admin' or v_target.id = auth.uid()
+     or (public.current_role() <> 'super_admin' and v_target.role <> 'staff') then
+    raise exception 'This account PIN cannot be reset by your role';
+  end if;
+  update public.profiles set pin_hash = extensions.crypt(p_new_pin, extensions.gen_salt('bf')) where id = p_user_id;
+  insert into public.audit_logs(actor_id, action, entity_type, entity_id, details)
+  values (auth.uid(), 'user_pin_reset', 'profile', p_user_id::text, jsonb_build_object('email', v_target.email));
+end
+$$;
+
 create or replace function public.rollback_bill_stock(p_bill_id uuid, p_reason text, p_actor uuid)
 returns void
 language plpgsql security definer
@@ -427,6 +578,9 @@ set search_path = ''
 as $$
 declare v_size public.paper_size; v_sheets bigint;
 begin
+  update public.customers c set balance = c.balance - (b.total - b.amount_paid)
+  from public.bills b
+  where b.id = p_bill_id and b.customer_id = c.id;
   for v_size in select paper from (values ('A4'::public.paper_size), ('A5'::public.paper_size)) as sizes(paper) order by paper
   loop
     select coalesce(sum(sheets_used), 0) into v_sheets from public.bill_items
@@ -563,6 +717,7 @@ alter table public.bills enable row level security;
 alter table public.bill_items enable row level security;
 alter table public.audit_logs enable row level security;
 alter table public.pin_verification_limits enable row level security;
+alter table public.customers enable row level security;
 
 drop policy if exists profiles_read_approved on public.profiles;
 create policy profiles_read_approved on public.profiles for select to authenticated
@@ -576,6 +731,9 @@ using (public.is_approved_user());
 drop policy if exists services_manage_admin on public.services;
 create policy services_manage_admin on public.services for update to authenticated
 using (public.is_admin()) with check (public.is_admin());
+drop policy if exists services_insert_admin on public.services;
+create policy services_insert_admin on public.services for insert to authenticated
+with check (public.is_admin() and category = 'other' and paper_size = 'none');
 
 drop policy if exists inventory_read_approved on public.inventory;
 create policy inventory_read_approved on public.inventory for select to authenticated
@@ -588,6 +746,10 @@ using (public.is_approved_user() and (requested_by = auth.uid() or public.is_adm
 drop policy if exists bills_read_authorized on public.bills;
 create policy bills_read_authorized on public.bills for select to authenticated
 using (public.is_approved_user() and (created_by = auth.uid() or public.is_admin()));
+
+drop policy if exists customers_admin_read on public.customers;
+create policy customers_admin_read on public.customers for select to authenticated
+using (public.is_admin());
 
 drop policy if exists bill_items_read_authorized on public.bill_items;
 create policy bill_items_read_authorized on public.bill_items for select to authenticated
@@ -603,18 +765,21 @@ using (public.is_admin());
 revoke all on public.app_settings, public.audit_logs, public.pin_verification_limits from anon, authenticated;
 revoke select on public.profiles from anon, authenticated;
 revoke insert, update, delete on public.profiles from anon, authenticated;
-revoke insert, update, delete on public.inventory, public.stock_requests, public.bills, public.bill_items from anon, authenticated;
+revoke insert, update, delete on public.inventory, public.stock_requests, public.bills, public.bill_items, public.customers from anon, authenticated;
 revoke insert, update, delete on public.services from anon, authenticated;
+revoke select on public.customers from anon, authenticated;
 grant select (id, full_name, email, phone, role, approval_status, created_at, updated_at) on public.profiles to authenticated;
 grant select on public.services, public.inventory, public.stock_requests, public.bills, public.bill_items to authenticated;
 grant update (unit_price, active, name, category, paper_size, side_type) on public.services to authenticated;
+grant insert (name, category, paper_size, side_type, unit_price, active) on public.services to authenticated;
+grant select on public.customers to authenticated;
 grant select on public.audit_logs to authenticated;
 
 revoke all on function public.current_role() from public, anon;
 revoke all on function public.is_approved_user() from public, anon;
 revoke all on function public.is_admin() from public, anon;
 revoke all on function public.verify_pos_pin(text) from public, anon;
-revoke all on function public.create_bill(jsonb) from public, anon;
+revoke all on function public.create_bill(jsonb, uuid, text, text, numeric, boolean, text) from public, anon;
 revoke all on function public.add_paper_stock(public.paper_size, bigint, text) from public, anon;
 revoke all on function public.resolve_stock_request(uuid, boolean, text) from public, anon;
 revoke all on function public.request_bill_cancellation(uuid, text) from public, anon;
@@ -624,11 +789,14 @@ revoke all on function public.resolve_bill_cancellation(uuid, boolean, text) fro
 revoke all on function public.admin_review_account(uuid, boolean, text) from public, anon;
 revoke all on function public.admin_set_role(uuid, public.app_role, text, text) from public, anon;
 revoke all on function public.admin_delete_user(uuid, text, text) from public, anon;
+revoke all on function public.search_customers(text) from public, anon;
+revoke all on function public.get_customer_balance(uuid) from public, anon;
+revoke all on function public.admin_reset_pin(uuid, text, text) from public, anon;
 grant execute on function public.current_role() to authenticated;
 grant execute on function public.is_approved_user() to authenticated;
 grant execute on function public.is_admin() to authenticated;
 grant execute on function public.verify_pos_pin(text) to authenticated;
-grant execute on function public.create_bill(jsonb) to authenticated;
+grant execute on function public.create_bill(jsonb, uuid, text, text, numeric, boolean, text) to authenticated;
 grant execute on function public.add_paper_stock(public.paper_size, bigint, text) to authenticated;
 grant execute on function public.resolve_stock_request(uuid, boolean, text) to authenticated;
 grant execute on function public.request_bill_cancellation(uuid, text) to authenticated;
@@ -637,9 +805,14 @@ grant execute on function public.resolve_bill_cancellation(uuid, boolean, text) 
 grant execute on function public.admin_review_account(uuid, boolean, text) to authenticated;
 grant execute on function public.admin_set_role(uuid, public.app_role, text, text) to authenticated;
 grant execute on function public.admin_delete_user(uuid, text, text) to authenticated;
+grant execute on function public.search_customers(text) to authenticated;
+grant execute on function public.get_customer_balance(uuid) to authenticated;
+grant execute on function public.admin_reset_pin(uuid, text, text) to authenticated;
 
 -- Setup after running this file:
 -- 1. Replace app_settings.super_admin_email with the owner's exact email.
 -- 2. Set Authentication > URL Configuration > Site URL and redirect URLs.
 -- 3. Enable email confirmations and configure SMTP in Supabase Auth.
 -- 4. Put the project URL and anon/public key into app.js. Never use a service-role key in the browser.
+
+NOTIFY pgrst, 'reload schema';

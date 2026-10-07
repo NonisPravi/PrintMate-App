@@ -14,13 +14,22 @@
     services: [],
     inventory: [],
     cart: [],
-    category: "printout",
+    category: "photocopy",
+    config: { size: "A4", color: "bw", side: "single" },
+    customerMatches: [],
+    ledgerCustomers: [],
+    selectedCustomer: null,
+    customerPhone: "",
+    paymentTouched: false,
+    verifiedPricePin: null,
+    resetPinUserId: null,
     pendingPinAction: null,
     dangerAction: null,
     activeSection: "pos"
   };
 
   const el = {
+    loadingScreen: $("#loading-screen"),
     authScreen: $("#auth-screen"), mainScreen: $("#main-screen"),
     loginForm: $("#login-form"), registerForm: $("#register-form"), recoveryForm: $("#recovery-form"),
     authTitle: $("#auth-title"), authSubtitle: $("#auth-subtitle"),
@@ -32,14 +41,17 @@
     checkoutButton: $("#checkout-button"), toastRegion: $("#toast-region"),
     inventoryDialog: $("#inventory-dialog"), pinDialog: $("#pin-dialog"),
     dangerDialog: $("#danger-dialog"), priceDialog: $("#price-dialog"),
-    stockSummary: $("#stock-summary"), lowStockAlert: $("#low-stock-alert")
+    stockSummary: $("#stock-summary"), lowStockAlert: $("#low-stock-alert"),
+    customerSearch: $("#customer-search"), customerBalance: $("#customer-balance"),
+    amountPaid: $("#amount-paid"), settlementSummary: $("#settlement-summary"),
+    serviceConfig: $("#service-config"), ledgerSection: $("#ledger-section")
   };
 
   const isAdmin = () => ["admin", "super_admin"].includes(state.profile?.role);
   const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, char => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   })[char]);
-  const currency = (value) => new Intl.NumberFormat(undefined, { style: "currency", currency: "INR" }).format(Number(value) || 0);
+  const currency = (value) => `Rs. ${(Number(value) || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   const asError = (error) => error?.message || "Something went wrong. Please try again.";
   const notify = (message, isError = false) => {
     const toast = document.createElement("div");
@@ -60,37 +72,56 @@
   };
 
   function init() {
-    if (!window.supabase || SUPABASE_URL.includes("YOUR_PROJECT") || SUPABASE_ANON_KEY.includes("YOUR_")) {
-      el.authScreen.classList.remove("hidden");
+    bindEvents();
+    if (!window.supabase || SUPABASE_URL.includes("YOUR_PROJECT") || SUPABASE_ANON_KEY.includes("YOUR_") || /^\*+$/.test(SUPABASE_ANON_KEY)) {
+      showAuth();
+      hideLoadingScreen();
       setAuthMessage("Connect your Supabase project by adding its URL and anon key at the top of app.js, then run supabase-schema.sql.", "error");
-      bindEvents();
       return;
     }
     state.supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
       auth: { autoRefreshToken: true, persistSession: true, detectSessionInUrl: true }
     });
-    bindEvents();
     state.supabase.auth.onAuthStateChange((event, session) => {
       if (event === "PASSWORD_RECOVERY") {
         showRecovery();
       }
       if (event === "SIGNED_OUT") resetToAuth();
     });
-    state.supabase.auth.getSession().then(({ data, error }) => {
-      if (error) return notify(asError(error), true);
-      if (data.session?.user) loadProfile(data.session.user);
-      else showAuth();
-    });
+    (async () => {
+      try {
+        const { data, error } = await state.supabase.auth.getSession();
+        if (error) throw error;
+        if (data.session?.user) await loadProfile(data.session.user);
+        else showAuth();
+      } catch (error) {
+        showAuth();
+        setAuthMessage(`Could not restore your session: ${asError(error)}`, "error");
+      } finally {
+        hideLoadingScreen();
+      }
+    })();
   }
 
   function bindEvents() {
     el.loginForm.addEventListener("submit", signIn);
     el.registerForm.addEventListener("submit", register);
     el.recoveryForm.addEventListener("submit", updatePassword);
-    $("#stock-form").addEventListener("submit", submitStock);
+    const stockForm = document.getElementById("stock-form");
+    if (stockForm) stockForm.addEventListener("submit", submitStock);
     $("#pin-form").addEventListener("submit", verifyPinForAction);
     $("#danger-form").addEventListener("submit", performDangerAction);
     $("#price-form").addEventListener("submit", savePrice);
+    $("#service-form").addEventListener("submit", createOtherService);
+    $("#customer-form").addEventListener("submit", useCustomerDetails);
+    $("#reset-pin-form").addEventListener("submit", resetStaffPin);
+    el.customerSearch.addEventListener("input", handleCustomerSearchInput);
+    el.customerSearch.addEventListener("change", selectCustomer);
+    el.amountPaid.addEventListener("input", () => {
+      state.paymentTouched = true;
+      renderSettlement();
+    });
+    $("#save-credit").addEventListener("change", renderSettlement);
     $("#category-tabs").addEventListener("click", event => {
       const button = event.target.closest("[data-category]");
       if (!button) return;
@@ -100,14 +131,28 @@
         tab.classList.toggle("active", active);
         tab.setAttribute("aria-selected", String(active));
       });
+      el.serviceConfig.classList.toggle("hidden", state.category === "other");
       renderServices();
     });
+    el.serviceConfig.addEventListener("click", event => {
+      const button = event.target.closest("[data-choice]");
+      if (!button) return;
+      const group = button.closest("[data-choice-group]")?.dataset.choiceGroup;
+      if (!group) return;
+      state.config[group] = button.dataset.choice;
+      $$(`[data-choice-group="${group}"] .choice-button`).forEach(choice => choice.classList.toggle("active", choice === button));
+      renderServices();
+    });
+    $("#add-configured-service").addEventListener("click", addConfiguredService);
     el.serviceGrid.addEventListener("click", event => {
       const button = event.target.closest("[data-service-id]");
       if (button) addService(button.dataset.serviceId);
     });
     el.cartItems.addEventListener("input", updateCartInput);
-    el.cartItems.addEventListener("change", updateCartSelect);
+    el.cartItems.addEventListener("change", event => {
+      if (event.target.matches('[data-field="side"]')) updateCartSelect(event);
+      if (event.target.matches('[data-field="unit_price"]')) requestPriceChange(event.target);
+    });
     el.cartItems.addEventListener("click", event => {
       const button = event.target.closest("[data-remove-index]");
       if (button) requestPinToRemove(Number(button.dataset.removeIndex));
@@ -127,8 +172,14 @@
       if (billAction) handleBillAction(billAction, event.target.closest("[data-bill-action]"));
       const teamAction = event.target.closest("[data-team-action]")?.dataset.teamAction;
       if (teamAction) handleTeamAction(teamAction, event.target.closest("[data-team-action]"));
+      const managementTab = event.target.closest("[data-management-tab]")?.dataset.managementTab;
+      if (managementTab) switchManagementTab(managementTab);
     });
     el.checkoutButton.addEventListener("click", checkout);
+    $("#customer-ledger").addEventListener("click", event => {
+      const row = event.target.closest("[data-customer-id]");
+      if (row) loadCustomerStatement(row.dataset.customerId);
+    });
   }
 
   async function handleAction(action, target) {
@@ -139,9 +190,16 @@
       if (error) notify(asError(error), true);
     }
     if (action === "open-inventory") openInventory();
+    if (action === "new-customer") {
+      const form = $("#customer-form");
+      form.reset();
+      $('input[name="name"]', form).value = el.customerSearch.value.trim();
+      $("#customer-dialog").showModal();
+    }
     if (action === "close-pin") el.pinDialog.close();
     if (action === "close-danger") el.dangerDialog.close();
     if (action === "refresh-history") loadBills();
+    if (action === "refresh-ledger") loadCustomerLedger();
     if (action === "checkout") checkout();
     if (action === "remove-row") requestPinToRemove(Number(target.dataset.index));
   }
@@ -151,10 +209,19 @@
     el.mainScreen.classList.add("hidden");
   }
 
+  function hideLoadingScreen() {
+    el.loadingScreen.classList.add("hidden");
+    document.body.classList.add("app-ready");
+  }
+
   function resetToAuth() {
     state.user = null;
     state.profile = null;
     state.cart = [];
+    state.selectedCustomer = null;
+    state.customerPhone = "";
+    state.customerMatches = [];
+    state.paymentTouched = false;
     el.mainScreen.classList.add("hidden");
     el.authScreen.classList.remove("hidden");
     el.loginForm.reset();
@@ -164,6 +231,10 @@
     el.registerForm.classList.add("hidden");
     el.recoveryForm.classList.add("hidden");
     $(".auth-switch").classList.remove("hidden");
+    el.customerSearch.value = "";
+    $("#customer-options").replaceChildren();
+    el.customerBalance.classList.add("hidden");
+    $("#save-credit").checked = false;
     renderCart();
   }
 
@@ -173,12 +244,17 @@
     const form = new FormData(el.loginForm);
     const button = $('button[type="submit"]', el.loginForm);
     setBusy(button, true);
-    const { data, error } = await state.supabase.auth.signInWithPassword({
-      email: String(form.get("email")).trim(), password: String(form.get("password"))
-    });
-    setBusy(button, false);
-    if (error) return setAuthMessage(asError(error), "error");
-    await loadProfile(data.user);
+    try {
+      const { data, error } = await state.supabase.auth.signInWithPassword({
+        email: String(form.get("email")).trim(), password: String(form.get("password"))
+      });
+      if (error) throw error;
+      await loadProfile(data.user);
+    } catch (error) {
+      setAuthMessage(asError(error), "error");
+    } finally {
+      setBusy(button, false);
+    }
   }
 
   async function register(event) {
@@ -187,19 +263,24 @@
     const form = new FormData(el.registerForm);
     const button = $('button[type="submit"]', el.registerForm);
     setBusy(button, true);
-    const { data, error } = await state.supabase.auth.signUp({
-      email: String(form.get("email")).trim(),
-      password: String(form.get("password")),
-      options: { data: { full_name: String(form.get("full_name")).trim(), phone: String(form.get("phone")).trim(), quick_pin: String(form.get("pin")) } }
-    });
-    setBusy(button, false);
-    if (error) return setAuthMessage(asError(error), "error");
-    if (!data.session) {
-      el.registerForm.reset();
-      return setAuthMessage("Check your email to verify your account. New accounts also need Admin approval before POS access.", "success");
+    try {
+      const { data, error } = await state.supabase.auth.signUp({
+        email: String(form.get("email")).trim(),
+        password: String(form.get("password")),
+        options: { data: { full_name: String(form.get("full_name")).trim(), phone: String(form.get("phone")).trim(), quick_pin: String(form.get("pin")) } }
+      });
+      if (error) throw error;
+      if (!data.session) {
+        el.registerForm.reset();
+        return setAuthMessage("Check your email to verify your account. New accounts also need Admin approval before POS access.", "success");
+      }
+      setAuthMessage("Account created. It is pending Admin approval.", "success");
+      await loadProfile(data.user);
+    } catch (error) {
+      setAuthMessage(asError(error), "error");
+    } finally {
+      setBusy(button, false);
     }
-    setAuthMessage("Account created. It is pending Admin approval.", "success");
-    await loadProfile(data.user);
   }
 
   async function forgotPassword() {
@@ -247,7 +328,8 @@
     state.user = user;
     const { data: profile, error } = await state.supabase.from("profiles").select("id,full_name,email,phone,role,approval_status").eq("id", user.id).maybeSingle();
     if (error) {
-      notify(`Could not load your account: ${asError(error)}`, true);
+      showAuth();
+      setAuthMessage(`Could not load your account: ${asError(error)}`, "error");
       return;
     }
     if (!profile) {
@@ -264,7 +346,7 @@
     $("#user-name").textContent = profile.full_name;
     $("#user-initial").textContent = (profile.full_name || "P").trim().charAt(0).toUpperCase();
     $("#role-badge").textContent = profile.role.replace("_", " ");
-    el.adminNav.classList.toggle("hidden", !isAdmin());
+    $$(".admin-only").forEach(node => node.classList.toggle("hidden", !isAdmin()));
     await loadOperationalData();
     el.authScreen.classList.add("hidden");
     el.mainScreen.classList.remove("hidden");
@@ -295,6 +377,21 @@
 
   function renderServices() {
     const services = state.services.filter(service => service.category === state.category);
+    if (state.category !== "other") {
+      const config = state.config;
+      const wantedColor = config.color === "color";
+      const service = services.find(item => {
+        const name = item.name.toLowerCase();
+        const isColor = /\bcolou?r\b/.test(name);
+        return item.paper_size === config.size && item.side_type === config.side && isColor === wantedColor;
+      });
+      $("#add-configured-service").disabled = !service;
+      el.serviceGrid.innerHTML = service
+        ? `<div class="service-preview"><div><strong>${escapeHtml(service.name)}</strong><span>${escapeHtml(config.size)} · ${config.color === "color" ? "Color" : "B/W"} · ${config.side === "single" ? "Single" : "Double"} sided</span></div><strong>${currency(service.unit_price)}<small> / page</small></strong></div>`
+        : '<div class="empty-list">No configured price for this combination. Ask an administrator to add or price the service.</div>';
+      return;
+    }
+    $("#add-configured-service").disabled = true;
     if (!services.length) {
       el.serviceGrid.innerHTML = '<div class="empty-list">No services in this category yet.</div>';
       return;
@@ -302,14 +399,25 @@
     el.serviceGrid.innerHTML = services.map(service => `
       <button class="service-card" type="button" data-service-id="${escapeHtml(service.id)}">
         <span><span class="service-name">${escapeHtml(service.name)}</span><span class="service-meta">${service.paper_size === "none" ? "Service" : `${escapeHtml(service.paper_size)} paper`} · ${escapeHtml(service.side_type)}-sided</span></span>
-        <span class="service-price">${currency(service.unit_price)}<small style="font-size:10px;color:#8994a6"> /page</small></span>
+        <span class="service-price">${currency(service.unit_price)}</span>
       </button>`).join("");
+  }
+
+  function addConfiguredService() {
+    if (state.category === "other") return;
+    const { size, color, side } = state.config;
+    const service = state.services.find(item => {
+      const name = item.name.toLowerCase();
+      return item.category === state.category && item.paper_size === size && item.side_type === side
+        && /\bcolou?r\b/.test(name) === (color === "color");
+    });
+    if (service) addService(service.id);
   }
 
   function addService(serviceId) {
     const service = state.services.find(item => item.id === serviceId);
     if (!service) return;
-    state.cart.push({ key: crypto.randomUUID(), serviceId: service.id, pages: 1, copies: 1 });
+    state.cart.push({ key: crypto.randomUUID(), serviceId: service.id, unitPrice: Number(service.unit_price), pages: 1, copies: 1 });
     renderCart();
     if (navigator.vibrate) navigator.vibrate(12);
   }
@@ -329,7 +437,7 @@
 
   function rowTotal(row) {
     const service = getService(row.serviceId);
-    return service ? Math.max(0, Number(service.unit_price)) * row.pages * row.copies : 0;
+    return service ? Math.max(0, Number(row.unitPrice ?? service.unit_price)) * row.pages * row.copies : 0;
   }
 
   function renderCart() {
@@ -341,7 +449,7 @@
         const service = getService(row.serviceId);
         if (!service) return "";
         return `<article class="cart-row">
-          <div class="cart-row-head"><div><div class="cart-row-title">${escapeHtml(service.name)}</div><div class="service-meta">${escapeHtml(service.side_type)}-sided · ${currency(service.unit_price)}/page</div></div>
+          <div class="cart-row-head"><div><div class="cart-row-title">${escapeHtml(service.name)}</div><div class="service-meta">${escapeHtml(service.side_type)}-sided · ${currency(row.unitPrice ?? service.unit_price)}/page</div></div>
             <div class="cart-row-total">${currency(rowTotal(row))}</div>
             <button class="remove-row" type="button" data-remove-index="${index}" aria-label="Remove ${escapeHtml(service.name)}">×</button>
           </div>
@@ -351,7 +459,7 @@
             <label>Side<select data-index="${index}" data-field="side" aria-label="Print side for ${escapeHtml(service.name)}" ${sideVariants(service).length < 2 ? "disabled" : ""}>
               ${sideVariants(service).map(variant => `<option value="${escapeHtml(variant.id)}" ${variant.id === service.id ? "selected" : ""}>${escapeHtml(variant.side_type === "double" ? "Double" : "Single")}</option>`).join("")}
             </select></label>
-            <label>Unit price<input type="number" inputmode="decimal" value="${Number(service.unit_price).toFixed(2)}" step="0.01" readonly aria-label="Unit price for ${escapeHtml(service.name)}"></label>
+            <label>Unit price<input type="number" inputmode="decimal" min="0" value="${Number(row.unitPrice ?? service.unit_price).toFixed(2)}" step="0.01" ${service.category === "printout" ? `data-index="${index}" data-field="unit_price"` : "readonly"} aria-label="Unit price for ${escapeHtml(service.name)}"></label>
           </div>
           <div class="row-price"><span>${service.paper_size === "none" ? "No paper deduction" : `${escapeHtml(service.paper_size)} sheets: ${sheetsUsed(service, row.pages, row.copies)}`}</span><span>Row total ${currency(rowTotal(row))}</span></div>
         </article>`;
@@ -361,6 +469,8 @@
     $("#cart-count").textContent = `${state.cart.length} ${state.cart.length === 1 ? "item" : "items"}`;
     el.cartTotal.textContent = currency(total);
     el.checkoutButton.disabled = state.cart.length === 0;
+    if (!state.paymentTouched && el.amountPaid) el.amountPaid.value = netPayable().toFixed(2);
+    renderSettlement();
   }
 
   function sheetsUsed(service, pages, copies) {
@@ -380,6 +490,149 @@
     renderCartPreservingFocus(index, input.dataset.field, input.value);
   }
 
+  function subtotal() {
+    return state.cart.reduce((sum, row) => sum + rowTotal(row), 0);
+  }
+
+  function previousCustomerBalance() {
+    return Number(state.selectedCustomer?.balance) || 0;
+  }
+
+  function netPayable() {
+    return Math.max(0, subtotal() + previousCustomerBalance());
+  }
+
+  function renderSettlement() {
+    if (!el.amountPaid || !el.settlementSummary) return;
+    const due = netPayable();
+    const paid = Math.max(0, Number(el.amountPaid.value) || 0);
+    const previous = previousCustomerBalance();
+    const saveCredit = $("#save-credit").checked;
+    const applied = saveCredit ? paid : Math.min(paid, due);
+    const nextBalance = previous + subtotal() - applied;
+    let settlement = `Net payable: ${currency(due)}`;
+    if (paid < due) settlement += ` · Remaining: ${currency(due - paid)}`;
+    else if (paid > due && !saveCredit) settlement += ` · Change due: ${currency(paid - due)}`;
+    else if (paid > due) settlement += ` · Customer credit: ${currency(Math.abs(nextBalance))}`;
+    if (nextBalance > 0.005) settlement += ` · New debit: ${currency(nextBalance)}`;
+    el.settlementSummary.textContent = settlement;
+  }
+
+  async function searchCustomers() {
+    const query = el.customerSearch.value.trim();
+    if (query.length < 2 || !state.supabase) {
+      state.customerMatches = [];
+      $("#customer-options").replaceChildren();
+      return;
+    }
+    window.clearTimeout(state.customerSearchTimer);
+    state.customerSearchTimer = window.setTimeout(async () => {
+      try {
+        const results = await callRpc("search_customers", { p_query: query });
+        state.customerMatches = results || [];
+        $("#customer-options").innerHTML = state.customerMatches.map(customer => {
+          const option = document.createElement("option");
+          option.value = `${customer.name} [${customer.customer_code}]${customer.phone ? ` · ${customer.phone}` : ""}`;
+          option.dataset.customerId = customer.id;
+          return option.outerHTML;
+        }).join("");
+      } catch (error) {
+        notify(`Could not search customers: ${asError(error)}`, true);
+      }
+    }, 220);
+  }
+
+  function handleCustomerSearchInput() {
+    const value = el.customerSearch.value.trim();
+    if (state.selectedCustomer && value !== state.selectedCustomer.name
+      && !value.includes(`[${state.selectedCustomer.customer_code}]`)) {
+      state.selectedCustomer = null;
+      state.customerPhone = "";
+      state.paymentTouched = false;
+      el.customerBalance.classList.add("hidden");
+      el.amountPaid.value = netPayable().toFixed(2);
+      renderSettlement();
+    }
+    searchCustomers();
+  }
+
+  async function selectCustomer() {
+    const value = el.customerSearch.value.trim();
+    let customer = state.customerMatches.find(item => value.includes(`[${item.customer_code}]`) || value === item.name || value === item.phone);
+    if (!customer && value.length >= 2) {
+      try {
+        const matches = await callRpc("search_customers", { p_query: value });
+        state.customerMatches = matches || [];
+        customer = state.customerMatches.find(item => value.includes(`[${item.customer_code}]`) || value === item.name || value === item.phone);
+      } catch (error) {
+        notify(`Could not find customer: ${asError(error)}`, true);
+      }
+    }
+    if (customer) {
+      let balance = 0;
+      try {
+        balance = Number(await callRpc("get_customer_balance", { p_customer_id: customer.id })) || 0;
+        if (el.customerSearch.value.trim() !== value) return;
+        state.selectedCustomer = { ...customer, balance };
+        state.customerPhone = customer.phone || "";
+      } catch (error) {
+        state.selectedCustomer = null;
+        state.customerPhone = "";
+        el.customerSearch.value = "";
+        notify(`Could not load customer balance: ${asError(error)}`, true);
+        return;
+      }
+      el.customerBalance.textContent = balance > 0
+        ? `Customer owes ${currency(balance)}`
+        : balance < 0
+          ? `Available Credit: ${currency(Math.abs(balance))}`
+          : "No outstanding balance";
+      el.customerBalance.className = `customer-balance${balance > 0 ? " debit" : balance < 0 ? " credit" : ""}`;
+    } else {
+      state.selectedCustomer = null;
+      state.customerPhone = "";
+      el.customerBalance.classList.add("hidden");
+    }
+    state.paymentTouched = false;
+    if (el.amountPaid) el.amountPaid.value = netPayable().toFixed(2);
+    renderSettlement();
+  }
+
+  function useCustomerDetails(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const name = String(form.get("name") || "").trim();
+    if (!name) return;
+    state.selectedCustomer = null;
+    state.customerPhone = String(form.get("phone") || "").trim();
+    el.customerSearch.value = name;
+    el.customerBalance.classList.add("hidden");
+    state.paymentTouched = false;
+    el.amountPaid.value = netPayable().toFixed(2);
+    $("#customer-dialog").close();
+    renderSettlement();
+  }
+
+  function requestPriceChange(input) {
+    const index = Number(input.dataset.index);
+    const row = state.cart[index];
+    const price = Number(input.value);
+    if (!row || !Number.isFinite(price) || price < 0 || price > 999999) {
+      renderCart();
+      notify("Enter a valid unit price.", true);
+      return;
+    }
+    const service = getService(row.serviceId);
+    if (!service || service.category !== "printout") return renderCart();
+    if (price === Number(row.unitPrice ?? service.unit_price)) return;
+    state.pendingPinAction = { type: "edit_price", index, price };
+    const form = $("#pin-form");
+    form.reset();
+    $("#pin-description").textContent = "Enter your four-digit staff PIN to confirm this printout rate.";
+    el.pinDialog.showModal();
+    $('input[name="pin"]', form).focus();
+  }
+
   function updateCartSelect(event) {
     const select = event.target.closest('select[data-field="side"]');
     if (!select) return;
@@ -387,6 +640,7 @@
     const service = getService(select.value);
     if (!state.cart[index] || !service) return;
     state.cart[index].serviceId = service.id;
+    state.cart[index].unitPrice = Number(service.unit_price);
     renderCart();
   }
 
@@ -420,6 +674,13 @@
         state.cart.splice(state.pendingPinAction.index, 1);
         renderCart();
         notify("Draft item removed.");
+      } else if (state.pendingPinAction?.type === "edit_price") {
+        const row = state.cart[state.pendingPinAction.index];
+        if (!row) throw new Error("That bill item is no longer available.");
+        row.unitPrice = state.pendingPinAction.price;
+        state.verifiedPricePin = String(pin);
+        renderCart();
+        notify("Custom printout price confirmed.");
       }
       el.pinDialog.close();
       state.pendingPinAction = null;
@@ -432,23 +693,63 @@
 
   async function checkout() {
     if (!state.cart.length || el.checkoutButton.disabled) return;
+    const customerName = state.selectedCustomer?.name || el.customerSearch.value.trim();
+    if (!customerName) {
+      el.customerSearch.focus();
+      return notify("Enter or select a customer name before completing the bill.", true);
+    }
     const invalidInput = $$('input[data-field="pages"], input[data-field="copies"]', el.cartItems).find(input => !input.checkValidity());
     if (invalidInput) {
       invalidInput.reportValidity();
       invalidInput.focus();
       return;
     }
-    const items = state.cart.map(row => ({ service_id: row.serviceId, pages: row.pages, copies: row.copies }));
+    const items = state.cart.map(row => ({
+      service_id: row.serviceId, pages: row.pages, copies: row.copies,
+      unit_price: Number(row.unitPrice ?? getService(row.serviceId)?.unit_price)
+    }));
+    const paid = Number(el.amountPaid.value);
+    if (!Number.isFinite(paid) || paid < 0) {
+      el.amountPaid.focus();
+      return notify("Enter a valid amount paid.", true);
+    }
     setBusy(el.checkoutButton, true);
     try {
-      const result = await callRpc("create_bill", { p_items: items });
+      let result;
+      try {
+        result = await callRpc("create_bill", {
+          p_items: items,
+          p_customer_id: state.selectedCustomer?.id || null,
+          p_customer_name: customerName,
+          p_customer_phone: state.customerPhone || null,
+          p_amount_paid: paid,
+          p_save_credit: $("#save-credit").checked,
+          p_pin: state.verifiedPricePin
+        });
+        if (!result?.id) throw new Error("The bill was created without a returned ID. Please refresh Bills & Reports.");
+      } catch (error) {
+        notify(asError(error), true);
+        return;
+      }
       state.cart = [];
+      state.selectedCustomer = null;
+      state.customerPhone = "";
+      state.customerMatches = [];
+      state.paymentTouched = false;
+      state.verifiedPricePin = null;
+      el.customerSearch.value = "";
+      $("#customer-options").replaceChildren();
+      $("#save-credit").checked = false;
+      el.customerBalance.classList.add("hidden");
       renderCart();
-      await refreshInventory();
       notify(`Bill ${result.bill_number} completed · ${currency(result.total)}`);
-      if (state.activeSection === "history") await loadBills();
-    } catch (error) {
-      notify(asError(error), true);
+      const refreshResults = await Promise.allSettled([refreshInventory(), loadBills()]);
+      refreshResults.forEach((refreshResult, index) => {
+        if (refreshResult.status === "rejected") {
+          notify(`${index === 0 ? "Bill saved, but inventory" : "Bill saved, but history"} could not refresh: ${asError(refreshResult.reason)}`, true);
+        }
+      });
+      if (state.activeSection === "ledger" && isAdmin()) await loadCustomerLedger();
     } finally {
       setBusy(el.checkoutButton, false);
       el.checkoutButton.disabled = state.cart.length === 0;
@@ -487,7 +788,8 @@
         p_sheets: Number(form.get("sheets")),
         p_note: String(form.get("note") || "").trim() || null
       });
-      event.currentTarget.reset();
+      const stockForm = document.getElementById("stock-form");
+      if (stockForm) stockForm.reset();
       await refreshInventory();
       $("#inventory-message").textContent = result.status === "approved" ? "Sheets added to active stock." : "Stock request sent to an administrator for approval.";
       notify(result.status === "approved" ? "Paper stock updated." : "Stock request submitted.");
@@ -499,7 +801,7 @@
   async function loadManagement() {
     const [users, requests, team] = await Promise.all([
       state.supabase.from("profiles").select("id,full_name,email,role,approval_status,created_at").eq("approval_status", "pending").order("created_at"),
-      state.supabase.from("stock_requests").select("id,paper_size,sheets,note,status,created_at,requester:profiles!stock_requests_requested_by_fkey(full_name)").eq("status", "pending_approval").order("created_at"),
+      state.supabase.from("stock_requests").select("id,paper_size,sheets,note,status,created_at,requester:profiles!fk_stock_requests_profiles(full_name)").eq("status", "pending_approval").order("created_at"),
       state.supabase.from("profiles").select("id,full_name,email,role").eq("approval_status", "approved").order("full_name")
     ]);
     if (users.error) notify(`Could not load account approvals: ${asError(users.error)}`, true);
@@ -531,12 +833,99 @@
       <div class="list-row price-row"><div class="list-primary">${escapeHtml(service.name)}<span class="list-secondary">${escapeHtml(service.category)} · ${escapeHtml(service.paper_size || "No paper")} · ${escapeHtml(service.side_type)}</span></div><span class="price-value">${currency(service.unit_price)}</span><button class="small-button" data-edit-price="${escapeHtml(service.id)}">Edit price</button></div>`).join("") : '<div class="empty-list">No active services.</div>';
   }
 
+  async function createOtherService(event) {
+    event.preventDefault();
+    if (!isAdmin()) return;
+    const form = event.currentTarget;
+    const values = new FormData(form);
+    const name = String(values.get("name") || "").trim();
+    const price = Number(values.get("unit_price"));
+    if (!name || !Number.isFinite(price) || price < 0) return notify("Enter a valid service name and price.", true);
+    const submit = $('button[type="submit"]', form);
+    setBusy(submit, true);
+    try {
+      const { data, error } = await state.supabase.from("services").insert({
+        name, category: "other", paper_size: "none", side_type: "single", unit_price: price
+      }).select("id,name,category,paper_size,side_type,unit_price,active").single();
+      if (error) throw error;
+      state.services.push(data);
+      form.reset();
+      renderPrices();
+      if (state.category === "other") renderServices();
+      notify("Other service added.");
+    } catch (error) {
+      notify(`Could not create service: ${asError(error)}`, true);
+    } finally {
+      setBusy(submit, false);
+    }
+  }
+
+  async function resetStaffPin(event) {
+    event.preventDefault();
+    const values = new FormData(event.currentTarget);
+    const submit = $('button[type="submit"]', event.currentTarget);
+    setBusy(submit, true);
+    try {
+      await callRpc("admin_reset_pin", {
+        p_user_id: state.resetPinUserId,
+        p_new_pin: String(values.get("new_pin")),
+        p_admin_pin: String(values.get("admin_pin"))
+      });
+      $("#reset-pin-dialog").close();
+      state.resetPinUserId = null;
+      event.currentTarget.reset();
+      notify("Staff PIN reset.");
+    } catch (error) {
+      notify(asError(error), true);
+    } finally {
+      setBusy(submit, false);
+    }
+  }
+
+  function switchManagementTab(tabName) {
+    $$("[data-management-tab]").forEach(tab => {
+      const active = tab.dataset.managementTab === tabName;
+      tab.classList.toggle("active", active);
+      tab.setAttribute("aria-selected", String(active));
+    });
+    $$("[data-management-panel]").forEach(panel => panel.classList.toggle("hidden", panel.dataset.managementPanel !== tabName));
+  }
+
+  async function loadCustomerLedger() {
+    if (!isAdmin()) return;
+    const { data, error } = await state.supabase.from("customers")
+      .select("id,customer_code,name,phone,balance,created_at").order("name");
+    if (error) return notify(`Could not load customer ledger: ${asError(error)}`, true);
+    const customers = data || [];
+    state.ledgerCustomers = customers;
+    $("#customer-ledger").innerHTML = customers.length ? customers.map(customer => `
+      <button class="list-row ledger-row" type="button" data-customer-id="${escapeHtml(customer.id)}">
+        <span class="list-primary">${escapeHtml(customer.name)}<span class="list-secondary">${escapeHtml(customer.customer_code)} · ${escapeHtml(customer.phone || "No phone")}</span></span>
+        <span class="ledger-balance${Number(customer.balance) > 0 ? " debit" : Number(customer.balance) < 0 ? " credit" : ""}">${Number(customer.balance) > 0 ? "Debit " : Number(customer.balance) < 0 ? "Credit " : ""}${currency(Math.abs(Number(customer.balance)))}</span>
+      </button>`).join("") : '<div class="empty-list">No registered customer accounts yet.</div>';
+  }
+
+  async function loadCustomerStatement(customerId) {
+    if (!isAdmin()) return;
+    const customer = state.ledgerCustomers.find(item => item.id === customerId);
+    const { data, error } = await state.supabase.from("bills")
+      .select("id,bill_number,total,status,customer_name,previous_balance,amount_paid,new_balance,created_at,billed_by_profile:profiles!fk_bills_profiles(full_name),bill_items(service_name,pages,copies,line_total)")
+      .eq("customer_id", customerId).order("created_at", { ascending: false }).limit(100);
+    if (error) return notify(`Could not load customer statement: ${asError(error)}`, true);
+    $("#statement-title").textContent = customer ? `${customer.name} · ${customer.customer_code}` : "Customer statement";
+    $("#statement-rows").innerHTML = data?.length ? data.map(bill => `
+      <div class="list-row"><div class="list-primary">${escapeHtml(bill.bill_number)} · ${currency(bill.total)}<span class="list-secondary">${new Date(bill.created_at).toLocaleString()} · Paid ${currency(bill.amount_paid)} · Previous ${currency(bill.previous_balance)} · Balance ${currency(bill.new_balance)}</span><span class="bill-items-summary">${(bill.bill_items || []).map(item => `${escapeHtml(item.service_name)} × ${item.pages}p × ${item.copies}`).join(" · ")}</span></div><span class="status-pill ${escapeHtml(bill.status)}">${escapeHtml(bill.billed_by_profile?.full_name || "Former user")}</span></div>`).join("") : '<div class="empty-list">No bills for this customer.</div>';
+    $("#customer-statement").classList.remove("hidden");
+  }
+
   function renderTeam(team) {
     $("#team-list").innerHTML = team.length ? team.map(member => {
       const targetIsSuper = member.role === "super_admin";
-      const canManage = state.profile.role === "super_admin" || (!targetIsSuper && member.role !== "admin");
-      return `<div class="list-row"><div class="list-primary">${escapeHtml(member.full_name)}<span class="list-secondary">${escapeHtml(member.email)} · ${escapeHtml(member.role.replace("_", " "))}</span></div>
-        ${canManage ? `<div class="row-actions">${state.profile.role === "super_admin" ? `<button class="small-button" data-team-action="role:${escapeHtml(member.id)}:${member.role === "admin" ? "staff" : "admin"}">Make ${member.role === "admin" ? "staff" : "admin"}</button>` : ""}<button class="small-button reject" data-team-action="delete:${escapeHtml(member.id)}">Delete</button></div>` : ""}</div>`;
+      const canManage = !targetIsSuper && member.id !== state.user.id
+        && (state.profile.role === "super_admin" || member.role === "staff");
+      const badge = targetIsSuper ? '<span class="protected-badge">Protected Super Admin</span>' : `<span class="role-badge">${escapeHtml(member.role.replace("_", " "))}</span>`;
+      return `<div class="list-row"><div class="list-primary">${escapeHtml(member.full_name)}<span class="list-secondary">${escapeHtml(member.email)} · ${badge}</span></div>
+        ${canManage ? `<div class="row-actions"><button class="small-button" data-team-action="reset:${escapeHtml(member.id)}">Reset PIN</button>${state.profile.role === "super_admin" ? `<button class="small-button" data-team-action="role:${escapeHtml(member.id)}:${member.role === "admin" ? "staff" : "admin"}">Make ${member.role === "admin" ? "staff" : "admin"}</button>` : ""}<button class="small-button reject" data-team-action="delete:${escapeHtml(member.id)}">Delete</button></div>` : ""}</div>`;
     }).join("") : '<div class="empty-list">No approved team accounts.</div>';
   }
 
@@ -610,7 +999,11 @@
 
   async function handleTeamAction(value) {
     const [action, userId, role] = value.split(":");
-    if (action === "delete") {
+    if (action === "reset") {
+      state.resetPinUserId = userId;
+      $("#reset-pin-form").reset();
+      $("#reset-pin-dialog").showModal();
+    } else if (action === "delete") {
       openDanger({
         kind: "delete_user", userId, title: "Delete this staff account?",
         impact: "This permanently removes their login and profile. Historical bills remain in the audit trail. This cannot be undone.",
@@ -721,7 +1114,7 @@
 
   async function loadBills() {
     if (!state.user || !state.supabase) return;
-    let query = state.supabase.from("bills").select("id,bill_number,total,status,cancellation_reason,created_at,created_by,creator:profiles!bills_created_by_fkey(full_name),bill_items(id,service_name,pages,copies,unit_price,line_total,sheets_used,paper_size)").order("created_at", { ascending: false }).limit(100);
+    let query = state.supabase.from("bills").select("id,bill_number,total,status,cancellation_reason,customer_name,previous_balance,amount_paid,new_balance,created_at,created_by,billed_by_profile:profiles!fk_bills_profiles(full_name),bill_items(id,service_name,pages,copies,unit_price,line_total,sheets_used,paper_size)").order("created_at", { ascending: false }).limit(100);
     if (!isAdmin()) query = query.eq("created_by", state.user.id);
     const { data, error } = await query;
     if (error) return notify(`Could not load bills: ${asError(error)}`, true);
@@ -731,7 +1124,7 @@
   function renderBills(bills) {
     $("#bill-history").innerHTML = bills.length ? bills.map(bill => {
       const canCancel = bill.status === "completed" && bill.created_by === state.user.id;
-      return `<div class="list-row"><div class="list-primary">${escapeHtml(bill.bill_number)} · ${currency(bill.total)}<span class="list-secondary">${new Date(bill.created_at).toLocaleString()} · ${escapeHtml(bill.creator?.full_name || "Former user")}</span><span class="bill-items-summary">${(bill.bill_items || []).map(item => `${escapeHtml(item.service_name)} × ${item.pages}p × ${item.copies}`).join(" · ")}</span></div>
+      return `<div class="list-row"><div class="list-primary">${escapeHtml(bill.bill_number)} · ${currency(bill.total)}<span class="list-secondary">${escapeHtml(bill.customer_name)} · ${new Date(bill.created_at).toLocaleString()} · ${escapeHtml(bill.billed_by_profile?.full_name || "Former user")}</span><span class="bill-items-summary">Paid ${currency(bill.amount_paid)} · Balance ${currency(bill.new_balance)} · ${(bill.bill_items || []).map(item => `${escapeHtml(item.service_name)} × ${item.pages}p × ${item.copies}`).join(" · ")}</span></div>
         <div class="row-actions"><span class="status-pill ${escapeHtml(bill.status)}">${escapeHtml(bill.status.replaceAll("_", " "))}</span>
           ${isAdmin() && ["completed", "cancellation_pending"].includes(bill.status) ? `<button class="small-button reject" data-bill-action="void:${escapeHtml(bill.id)}">Void</button>` : ""}
           ${isAdmin() && bill.status === "cancellation_pending" ? `<button class="small-button approve" data-bill-action="approve-cancel:${escapeHtml(bill.id)}">Approve</button><button class="small-button reject" data-bill-action="reject-cancel:${escapeHtml(bill.id)}">Reject</button>` : ""}
@@ -741,14 +1134,16 @@
   }
 
   function switchSection(section) {
-    if (section !== "pos" && !isAdmin()) return;
+    if (["management", "ledger"].includes(section) && !isAdmin()) return;
     state.activeSection = section;
     el.posSection.classList.toggle("hidden", section !== "pos");
     el.managementSection.classList.toggle("hidden", section !== "management");
     el.historySection.classList.toggle("hidden", section !== "history");
+    el.ledgerSection.classList.toggle("hidden", section !== "ledger");
     $$(".nav-tab").forEach(tab => tab.classList.toggle("active", tab.dataset.section === section));
     if (section === "management") loadManagement();
     if (section === "history") loadBills();
+    if (section === "ledger") loadCustomerLedger();
   }
 
   function toggleAuth() {

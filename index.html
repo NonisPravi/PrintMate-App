@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#f5f7fb">
+  <meta name="theme-color" content="#0f172a">
   <title>PrintFlow POS</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -13,8 +13,18 @@
   <script src="app.js" defer></script>
 </head>
 <body>
+  <div id="loading-screen" class="loading-screen" role="status" aria-live="polite">
+    <div class="loader-brand"><span class="brand-mark">P</span><span>PrintFlow <span class="brand-light">POS</span></span></div>
+    <svg class="printer-loader" viewBox="0 0 120 100" aria-hidden="true">
+      <path class="printer-body" d="M26 34h68a10 10 0 0 1 10 10v31H16V44a10 10 0 0 1 10-10Z"/>
+      <path class="printer-paper" d="M35 7h50v24H35zM35 63h50v31H35z"/>
+      <path class="printer-line" d="M44 73h32M44 81h25"/>
+      <circle class="printer-light" cx="88" cy="47" r="3"/>
+    </svg>
+    <p>Loading workspace...</p>
+  </div>
   <main id="app" class="app-shell">
-    <section id="auth-screen" class="auth-screen">
+    <section id="auth-screen" class="auth-screen hidden">
       <div class="auth-brand"><span class="brand-mark">P</span><span>PrintFlow<span class="brand-light"> POS</span></span></div>
       <div class="auth-card">
         <div class="auth-heading">
@@ -61,10 +71,11 @@
 
       <div id="low-stock-alert" class="low-stock-alert hidden" role="alert"></div>
 
-      <nav id="admin-nav" class="section-nav hidden" aria-label="Management">
+      <nav id="admin-nav" class="section-nav" aria-label="Main navigation">
         <button class="nav-tab active" type="button" data-section="pos">Point of sale</button>
-        <button class="nav-tab" type="button" data-section="management">Management <span id="pending-count" class="count-pill hidden">0</span></button>
+        <button class="nav-tab admin-only hidden" type="button" data-section="management">Management <span id="pending-count" class="count-pill hidden">0</span></button>
         <button class="nav-tab" type="button" data-section="history">Bills &amp; reports</button>
+        <button class="nav-tab admin-only hidden" type="button" data-section="ledger">Customer ledger</button>
       </nav>
 
       <section id="pos-section" class="workspace">
@@ -74,18 +85,34 @@
             <span class="stock-mini" id="stock-summary"></span>
           </div>
           <div id="category-tabs" class="category-tabs" role="tablist" aria-label="Service category">
-            <button class="category-tab active" type="button" role="tab" aria-selected="true" data-category="printout">Printouts</button>
-            <button class="category-tab" type="button" role="tab" aria-selected="false" data-category="photocopy">Photocopies</button>
+            <button class="category-tab active" type="button" role="tab" aria-selected="true" data-category="photocopy">Photocopies</button>
+            <button class="category-tab" type="button" role="tab" aria-selected="false" data-category="printout">Printouts</button>
             <button class="category-tab" type="button" role="tab" aria-selected="false" data-category="other">Other services</button>
+          </div>
+          <div id="service-config" class="service-config">
+            <div class="config-group"><span>Size</span><div class="choice-row" data-choice-group="size"><button class="choice-button active" type="button" data-choice="A4">A4</button><button class="choice-button" type="button" data-choice="A5">A5</button></div></div>
+            <div class="config-group"><span>Color</span><div class="choice-row" data-choice-group="color"><button class="choice-button active" type="button" data-choice="bw">B/W</button><button class="choice-button" type="button" data-choice="color">Color</button></div></div>
+            <div class="config-group"><span>Sides</span><div class="choice-row" data-choice-group="side"><button class="choice-button active" type="button" data-choice="single">Single</button><button class="choice-button" type="button" data-choice="double">Double</button></div></div>
+            <button id="add-configured-service" class="button primary add-configured-button" type="button">Add to bill</button>
           </div>
           <div id="service-grid" class="service-grid" aria-live="polite"></div>
         </div>
 
         <aside class="cart-panel" aria-label="Current bill">
           <div class="cart-heading"><div><p class="eyebrow">CURRENT ORDER</p><h2>Bill summary</h2></div><span id="cart-count" class="cart-count">0 items</span></div>
+          <div class="customer-fields">
+            <label for="customer-search">Customer name, phone or code</label>
+            <div class="customer-search-row"><input id="customer-search" type="search" list="customer-options" autocomplete="off" placeholder="Search or enter a name" required><datalist id="customer-options"></datalist><button class="small-button" type="button" data-action="new-customer">New</button></div>
+            <div id="customer-balance" class="customer-balance hidden"></div>
+            <div class="payment-fields">
+              <label for="amount-paid">Amount paid (Rs.)</label><input id="amount-paid" type="number" min="0" step="0.01" inputmode="decimal" value="0.00">
+            </div>
+            <label class="checkbox-label"><input id="save-credit" type="checkbox"> Save overpayment as customer credit</label>
+            <div id="settlement-summary" class="settlement-summary">Net payable: Rs. 0.00</div>
+          </div>
           <div id="cart-items" class="cart-items"><div class="empty-cart"><span class="empty-icon">＋</span><strong>Your cart is empty</strong><span>Tap a service to add it to this bill.</span></div></div>
           <div class="cart-footer">
-            <div class="cart-total"><span>Total</span><strong id="cart-total">₹0.00</strong></div>
+            <div class="cart-total"><span>Subtotal</span><strong id="cart-total">Rs. 0.00</strong></div>
             <button id="checkout-button" class="button primary full checkout-button" type="button" disabled>Complete bill <span aria-hidden="true">→</span></button>
             <p class="cart-footnote">Paper stock updates automatically at checkout.</p>
           </div>
@@ -94,17 +121,27 @@
 
       <section id="management-section" class="dashboard-section hidden">
         <div class="section-heading"><div><p class="eyebrow">SHOP SETTINGS</p><h1>Management</h1><p class="subheading">Review accounts and stock requests, or update your service prices.</p></div></div>
-        <div class="dashboard-grid">
-          <article class="panel"><div class="panel-title"><div><h2>Account approvals</h2><p>Approve new teammates before they can use the POS.</p></div></div><div id="pending-users" class="list-content"></div></article>
-          <article class="panel"><div class="panel-title"><div><h2>Stock requests</h2><p>Staff replenishment requests awaiting review.</p></div></div><div id="stock-requests" class="list-content"></div></article>
-          <article class="panel price-panel"><div class="panel-title"><div><h2>Service prices</h2><p>Prices are applied and validated at checkout.</p></div></div><div id="service-prices" class="list-content"></div></article>
-          <article class="panel"><div class="panel-title"><div><h2>Team</h2><p>Manage approved staff and administrator access.</p></div></div><div id="team-list" class="list-content"></div></article>
+        <div id="management-tabs" class="management-tabs" role="tablist" aria-label="Management sections">
+          <button class="management-tab active" type="button" data-management-tab="approvals">Account approvals</button>
+          <button class="management-tab" type="button" data-management-tab="stock">Stock requests</button>
+          <button class="management-tab" type="button" data-management-tab="prices">Service prices</button>
+          <button class="management-tab" type="button" data-management-tab="team">Team &amp; Users</button>
         </div>
+        <article class="panel management-panel" data-management-panel="approvals"><div class="panel-title"><div><h2>Account approvals</h2><p>Approve new teammates before they can use the POS.</p></div></div><div id="pending-users" class="list-content"></div></article>
+        <article class="panel management-panel hidden" data-management-panel="stock"><div class="panel-title"><div><h2>Stock requests</h2><p>Staff replenishment requests awaiting review.</p></div></div><div id="stock-requests" class="list-content"></div></article>
+        <article class="panel management-panel hidden" data-management-panel="prices"><div class="panel-title"><div><h2>Service prices</h2><p>Configure fixed photocopy prices, printout defaults and other services.</p></div></div>
+          <form id="service-form" class="service-create-form"><label>New other service<input name="name" maxlength="100" required placeholder="e.g. Binding"></label><label>Starting price (Rs.)<input name="unit_price" type="number" min="0" step="0.01" required value="0"></label><button class="button secondary" type="submit">Add service</button></form><div id="service-prices" class="list-content"></div></article>
+        <article class="panel management-panel hidden" data-management-panel="team"><div class="panel-title"><div><h2>Team &amp; Users</h2><p>Manage team access and protect privileged accounts.</p></div></div><div id="team-list" class="list-content"></div></article>
       </section>
 
       <section id="history-section" class="dashboard-section hidden">
         <div class="section-heading"><div><p class="eyebrow">TRANSACTION RECORD</p><h1>Bills &amp; reports</h1><p class="subheading">Completed bills, cancellation requests, and audit-safe voids.</p></div><button class="button secondary" type="button" data-action="refresh-history">Refresh</button></div>
         <div class="panel history-panel"><div id="bill-history" class="list-content"></div></div>
+      </section>
+      <section id="ledger-section" class="dashboard-section hidden">
+        <div class="section-heading"><div><p class="eyebrow">ADMIN FINANCIALS</p><h1>Customer ledger</h1><p class="subheading">Balances and transaction statements are visible only to administrators.</p></div><button class="button secondary" type="button" data-action="refresh-ledger">Refresh</button></div>
+        <div class="panel"><div id="customer-ledger" class="list-content"></div></div>
+        <div id="customer-statement" class="panel statement-panel hidden"><div class="panel-title"><div><h2 id="statement-title">Customer statement</h2><p>Bill history and balance changes.</p></div></div><div id="statement-rows" class="list-content"></div></div>
       </section>
       <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
     </section>
@@ -150,6 +187,27 @@
     <form id="price-form" class="form-stack">
       <label>Unit price<input name="unit_price" type="number" inputmode="decimal" min="0" step="0.01" required></label>
       <button class="button primary full" type="submit">Save price</button>
+    </form>
+  </dialog>
+
+  <dialog id="customer-dialog" class="dialog-card compact-dialog">
+    <form method="dialog" class="dialog-dismiss"><button class="icon-button" aria-label="Close customer form">×</button></form>
+    <p class="eyebrow">CUSTOMER DETAILS</p><h2>New customer</h2>
+    <p class="dialog-intro">Customer details are saved with the bill. Add a phone number to create a reusable ledger account.</p>
+    <form id="customer-form" class="form-stack">
+      <label>Customer name<input name="name" maxlength="160" required placeholder="Full name"></label>
+      <label>Phone number <span class="label-hint">Optional</span><input name="phone" type="tel" maxlength="40" placeholder="Phone number"></label>
+      <button class="button primary full" type="submit">Use customer</button>
+    </form>
+  </dialog>
+
+  <dialog id="reset-pin-dialog" class="dialog-card compact-dialog">
+    <form method="dialog" class="dialog-dismiss"><button class="icon-button" aria-label="Close PIN reset">×</button></form>
+    <p class="eyebrow">TEAM SECURITY</p><h2>Reset staff PIN</h2>
+    <form id="reset-pin-form" class="form-stack">
+      <label>New 4-digit PIN<input name="new_pin" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required></label>
+      <label>Administrator PIN<input name="admin_pin" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required></label>
+      <button class="button primary full" type="submit">Reset PIN</button>
     </form>
   </dialog>
 </body>
